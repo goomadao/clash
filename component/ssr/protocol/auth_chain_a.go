@@ -292,6 +292,10 @@ func (a *authChain) packAuthData(data []byte) (outData []byte) {
 	defer a.mutex.Unlock()
 	a.connectionID++
 	if a.connectionID > 0xFF000000 {
+		a.clientID = nil
+	}
+	if len(a.clientID) == 0 {
+		a.clientID = make([]byte, 4)
 		rand.Read(a.clientID)
 		b := make([]byte, 4)
 		rand.Read(b)
@@ -351,7 +355,7 @@ func (a *authChain) packAuthData(data []byte) (outData []byte) {
 
 	// data
 	chunkLength, randLength := a.packedDataLen(data)
-	if chunkLength <= 1500 {
+	if chunkLength+authHeadLength <= cap(outData) {
 		outData = outData[:authHeadLength+chunkLength]
 	} else {
 		newOutData := make([]byte, authHeadLength+chunkLength)
