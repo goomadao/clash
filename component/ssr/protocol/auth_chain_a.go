@@ -230,7 +230,7 @@ func (a *authChain) initUserKeyAndID() {
 		if len(params) >= 2 {
 			if userID, err := strconv.ParseUint(params[0], 10, 32); err == nil {
 				binary.LittleEndian.PutUint32(a.uid[:], uint32(userID))
-				a.userKey = []byte(params[1])[:len(a.userKey)]
+				a.userKey = []byte(params[1])
 			}
 		}
 
