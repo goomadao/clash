@@ -60,6 +60,7 @@ func (c *Conn) Read(b []byte) (int, error) {
 }
 
 func (c *Conn) Write(b []byte) (int, error) {
+	bLen := len(b)
 	encoded, err := c.Encode(b)
 	if err != nil {
 		return 0, err
@@ -68,5 +69,5 @@ func (c *Conn) Write(b []byte) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return len(b), nil
+	return bLen, nil
 }

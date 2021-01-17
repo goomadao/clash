@@ -4,15 +4,12 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"encoding/binary"
-	"fmt"
-	"io"
 	"math/rand"
 	"strings"
 	"time"
 
 	"github.com/Dreamacro/clash/common/pool"
 	"github.com/Dreamacro/clash/component/ssr/tools"
-	"github.com/Dreamacro/clash/log"
 )
 
 type tlsAuthData struct {
@@ -23,9 +20,9 @@ type tls12Ticket struct {
 	*Base
 	*tlsAuthData
 	handshakeStatus int
-	sendSaver       bytes.Buffer
-	recvBuffer      bytes.Buffer
-	buffer          bytes.Buffer
+	sendBuf         bytes.Buffer
+	recvBuf         []byte
+	ticketBuf       map[string][]byte
 }
 
 func init() {
@@ -34,9 +31,9 @@ func init() {
 }
 
 func newTLS12Ticket(b *Base) Obfs {
-	return &tls12Ticket{
-		Base: b,
-	}
+	r := &tls12Ticket{Base: b, tlsAuthData: &tlsAuthData{}}
+	rand.Read(r.localClientID[:])
+	return r
 }
 
 func (t *tls12Ticket) initForConn() Obfs {
@@ -44,189 +41,157 @@ func (t *tls12Ticket) initForConn() Obfs {
 		Base:        t.Base,
 		tlsAuthData: &tlsAuthData{},
 	}
-	rand.Read(r.localClientID[:])
+	r.localClientID = t.localClientID
+	r.ticketBuf = make(map[string][]byte)
 	return r
 }
 
 func (t *tls12Ticket) GetObfsOverhead() int {
 	return 5
 }
-
 func (t *tls12Ticket) Decode(b []byte) ([]byte, bool, error) {
-	if t.handshakeStatus == -1 {
-		return b, false, nil
-	}
-	t.buffer.Reset()
 	if t.handshakeStatus == 8 {
-		t.recvBuffer.Write(b)
-		for t.recvBuffer.Len() > 5 {
-			var h [5]byte
-			t.recvBuffer.Read(h[:])
-			if !bytes.Equal(h[:3], []byte{0x17, 0x3, 0x3}) {
-				log.Warnln("incorrect magic number %x, 0x170303 is expected", h[:3])
-				return nil, false, errTLS12TicketAuthIncorrectMagicNumber
+		if len(t.recvBuf) == 0 {
+			t.recvBuf = pool.Get(pool.RelayBufferSize)[:0]
+		}
+		t.recvBuf = append(t.recvBuf, b...)
+		b = b[:0]
+		for len(t.recvBuf) > 5 {
+			if !bytes.Equal(t.recvBuf[:3], []byte{0x17, 3, 3}) {
+				return []byte{}, false, errTLS12TicketAuthIncorrectMagicNumber
 			}
-			size := int(binary.BigEndian.Uint16(h[3:5]))
-			if t.recvBuffer.Len() < size {
-				// 不够读，下回再读吧
-				unread := t.recvBuffer.Bytes()
-				t.recvBuffer.Reset()
-				t.recvBuffer.Write(h[:])
-				t.recvBuffer.Write(unread)
+			size := int(binary.BigEndian.Uint16(t.recvBuf[3:5]))
+			if len(t.recvBuf) < size+5 {
 				break
 			}
-			d := pool.Get(size)
-			t.recvBuffer.Read(d)
-			t.buffer.Write(d)
-			pool.Put(d)
+			b = append(b, t.recvBuf[5:5+size]...)
+			t.recvBuf = t.recvBuf[5+size:]
+			if len(t.recvBuf) == 0 {
+				pool.Put(t.recvBuf)
+				t.recvBuf = nil
+			}
 		}
-		return t.buffer.Bytes(), false, nil
+		return b, false, nil
 	}
 
 	if len(b) < 11+32+1+32 {
-		return nil, false, errTLS12TicketAuthTooShortData
+		return []byte{}, false, errTLS12TicketAuthTooShortData
 	}
 
-	hash := t.hmacSHA1(b[11 : 11+22])
-
-	if !hmac.Equal(b[33:33+tools.HmacSHA1Len], hash) {
-		return nil, false, errTLS12TicketAuthHMACError
+	if !hmac.Equal(b[33:33+tools.HmacSHA1Len], t.hmacSHA1(b[11:33])) {
+		return []byte{}, false, errTLS12TicketAuthHMACError
 	}
-	return nil, true, nil
+
+	if !hmac.Equal(b[len(b)-10:], t.hmacSHA1(b[:len(b)-10])) {
+		return []byte{}, false, errTLS12TicketAuthHMACError
+	}
+
+	return []byte{}, true, nil
 }
 
 func (t *tls12Ticket) Encode(b []byte) ([]byte, error) {
-	t.buffer.Reset()
-	switch t.handshakeStatus {
-	case 8:
-		if len(b) < 1024 {
-			d := []byte{0x17, 0x3, 0x3, 0, 0}
-			binary.BigEndian.PutUint16(d[3:5], uint16(len(b)&0xFFFF))
-			t.buffer.Write(d)
-			t.buffer.Write(b)
-			return t.buffer.Bytes(), nil
-		}
-		start := 0
-		var l int
-		for len(b)-start > 2048 {
-			l = rand.Intn(4096) + 100
-			if l > len(b)-start {
-				l = len(b) - start
+	if t.handshakeStatus == 8 {
+		ret := bytes.Buffer{}
+		for len(b) > 2048 {
+			size := rand.Intn(4096) + 100
+			if len(b) < size {
+				size = len(b)
 			}
-			packData(&t.buffer, b[start:start+l])
-			start += l
+			packedData := pool.Get(size + 5)
+			packData(packedData, b[:size])
+			ret.Write(packedData)
+			pool.Put(packedData)
+			b = b[size:]
 		}
-		if len(b)-start > 0 {
-			l = len(b) - start
-			packData(&t.buffer, b[start:start+l])
-		}
-		return t.buffer.Bytes(), nil
-	case 1:
 		if len(b) > 0 {
-			if len(b) < 1024 {
-				packData(&t.sendSaver, b)
-			} else {
-				start := 0
-				var l int
-				for len(b)-start > 2048 {
-					l = rand.Intn(4096) + 100
-					if l > len(b)-start {
-						l = len(b) - start
-					}
-					packData(&t.buffer, b[start:start+l])
-					start += l
-				}
-				if len(b)-start > 0 {
-					l = len(b) - start
-					packData(&t.buffer, b[start:start+l])
-				}
-				io.Copy(&t.sendSaver, &t.buffer)
-			}
-			return []byte{}, nil
+			packedData := pool.Get(len(b) + 5)
+			packData(packedData, b)
+			ret.Write(packedData)
+			pool.Put(packedData)
 		}
-		hmacData := make([]byte, 43)
-		handshakeFinish := []byte("\x14\x03\x03\x00\x01\x01\x16\x03\x03\x00\x20")
-		copy(hmacData, handshakeFinish)
-		rand.Read(hmacData[11:33])
-		h := t.hmacSHA1(hmacData[:33])
-		copy(hmacData[33:], h)
-		t.buffer.Write(hmacData)
-		io.Copy(&t.buffer, &t.sendSaver)
-		t.handshakeStatus = 8
-		return t.buffer.Bytes(), nil
-	case 0:
-		tlsData0 := []byte("\x00\x1c\xc0\x2b\xc0\x2f\xcc\xa9\xcc\xa8\xcc\x14\xcc\x13\xc0\x0a\xc0\x14\xc0\x09\xc0\x13\x00\x9c\x00\x35\x00\x2f\x00\x0a\x01\x00")
-		tlsData1 := []byte("\xff\x01\x00\x01\x00")
-		tlsData2 := []byte("\x00\x17\x00\x00\x00\x23\x00\xd0")
-		// tlsData3 := []byte("\x00\x0d\x00\x16\x00\x14\x06\x01\x06\x03\x05\x01\x05\x03\x04\x01\x04\x03\x03\x01\x03\x03\x02\x01\x02\x03\x00\x05\x00\x05\x01\x00\x00\x00\x00\x00\x12\x00\x00\x75\x50\x00\x00\x00\x0b\x00\x02\x01\x00\x00\x0a\x00\x06\x00\x04\x00\x17\x00\x18\x00\x15\x00\x66\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
-		tlsData3 := []byte("\x00\x0d\x00\x16\x00\x14\x06\x01\x06\x03\x05\x01\x05\x03\x04\x01\x04\x03\x03\x01\x03\x03\x02\x01\x02\x03\x00\x05\x00\x05\x01\x00\x00\x00\x00\x00\x12\x00\x00\x75\x50\x00\x00\x00\x0b\x00\x02\x01\x00\x00\x0a\x00\x06\x00\x04\x00\x17\x00\x18")
-
-		var tlsData [2048]byte
-		tlsDataLen := 0
-		copy(tlsData[0:], tlsData1)
-		tlsDataLen += len(tlsData1)
-		sni := t.sni(t.getHost())
-		copy(tlsData[tlsDataLen:], sni)
-		tlsDataLen += len(sni)
-		copy(tlsData[tlsDataLen:], tlsData2)
-		tlsDataLen += len(tlsData2)
-		ticketLen := rand.Intn(164)*2 + 64
-		tlsData[tlsDataLen-1] = uint8(ticketLen & 0xff)
-		tlsData[tlsDataLen-2] = uint8(ticketLen >> 8)
-		//ticketLen := 208
-		rand.Read(tlsData[tlsDataLen : tlsDataLen+ticketLen])
-		tlsDataLen += ticketLen
-		copy(tlsData[tlsDataLen:], tlsData3)
-		tlsDataLen += len(tlsData3)
-
-		length := 11 + 32 + 1 + 32 + len(tlsData0) + 2 + tlsDataLen
-		encodedData := make([]byte, length)
-		pdata := length - tlsDataLen
-		l := tlsDataLen
-		copy(encodedData[pdata:], tlsData[:tlsDataLen])
-		encodedData[pdata-1] = uint8(tlsDataLen)
-		encodedData[pdata-2] = uint8(tlsDataLen >> 8)
-		pdata -= 2
-		l += 2
-		copy(encodedData[pdata-len(tlsData0):], tlsData0)
-		pdata -= len(tlsData0)
-		l += len(tlsData0)
-		copy(encodedData[pdata-32:], t.localClientID[:])
-		pdata -= 32
-		l += 32
-		encodedData[pdata-1] = 0x20
-		pdata--
-		l++
-		copy(encodedData[pdata-32:], t.packAuthData())
-		pdata -= 32
-		l += 32
-		encodedData[pdata-1] = 0x3
-		encodedData[pdata-2] = 0x3 // tls version
-		pdata -= 2
-		l += 2
-		encodedData[pdata-1] = uint8(l)
-		encodedData[pdata-2] = uint8(l >> 8)
-		encodedData[pdata-3] = 0
-		encodedData[pdata-4] = 1
-		pdata -= 4
-		l += 4
-		encodedData[pdata-1] = uint8(l)
-		encodedData[pdata-2] = uint8(l >> 8)
-		pdata -= 2
-		l += 2
-		encodedData[pdata-1] = 0x1
-		encodedData[pdata-2] = 0x3 // tls version
-		pdata -= 2
-		l += 2
-		encodedData[pdata-1] = 0x16 // tls handshake
-		pdata--
-		l++
-		packData(&t.sendSaver, b)
-		t.handshakeStatus = 1
-		return encodedData, nil
-	default:
-		return nil, fmt.Errorf("unexpected handshake status: %d", t.handshakeStatus)
+		return ret.Bytes(), nil
 	}
+
+	if len(b) > 0 {
+		packedData := pool.Get(len(b) + 5)
+		packData(packedData, b)
+		t.sendBuf.Write(packedData)
+		pool.Put(packedData)
+	}
+
+	if t.handshakeStatus == 0 {
+		t.handshakeStatus = 1
+
+		data := bytes.NewBuffer([]byte{3, 3})
+
+		authData := pool.Get(32)
+		t.packAuthData(authData)
+		data.Write(authData)
+		pool.Put(authData)
+
+		data.WriteByte(0x20)
+		data.Write(t.localClientID[:])
+		data.Write([]byte{0x00, 0x1c, 0xc0, 0x2b, 0xc0, 0x2f, 0xcc, 0xa9, 0xcc, 0xa8, 0xcc, 0x14, 0xcc, 0x13, 0xc0, 0x0a, 0xc0, 0x14, 0xc0, 0x09, 0xc0, 0x13, 0x00, 0x9c, 0x00, 0x35, 0x00, 0x2f, 0x00, 0x0a})
+		data.Write([]byte{0x1, 0x0})
+
+		ext := bytes.NewBuffer([]byte{0xff, 0x01, 0x00, 0x01, 0x00})
+
+		host := t.getHost()
+		sniBytes := pool.Get(9 + len(host))
+		sni(host, sniBytes)
+		ext.Write(sniBytes)
+		pool.Put(sniBytes)
+
+		ext.Write([]byte{0, 0x17, 0, 0})
+
+		ticketBuf := t.packTicketBuf(host)
+		ext.Write(ticketBuf)
+
+		ext.Write([]byte{0x00, 0x0d, 0x00, 0x16, 0x00, 0x14, 0x06, 0x01, 0x06, 0x03, 0x05, 0x01, 0x05, 0x03, 0x04, 0x01, 0x04, 0x03, 0x03, 0x01, 0x03, 0x03, 0x02, 0x01, 0x02, 0x03})
+		ext.Write([]byte{0x00, 0x05, 0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00})
+		ext.Write([]byte{0x00, 0x12, 0x00, 0x00})
+		ext.Write([]byte{0x75, 0x50, 0x00, 0x00})
+		ext.Write([]byte{0x00, 0x0b, 0x00, 0x02, 0x01, 0x00})
+		ext.Write([]byte{0x00, 0x0a, 0x00, 0x06, 0x00, 0x04, 0x00, 0x17, 0x00, 0x18})
+
+		length := make([]byte, 2)
+
+		binary.BigEndian.PutUint16(length, uint16(ext.Len()))
+		data.Write(length)
+		data.Write(ext.Bytes())
+
+		ret := make([]byte, 9+data.Len())
+		copy(ret, []byte{0x16, 3, 1})
+		binary.BigEndian.PutUint16(ret[3:5], uint16(data.Len()+4))
+		copy(ret[5:7], []byte{1, 0})
+		binary.BigEndian.PutUint16(ret[7:9], uint16(data.Len()))
+		copy(ret[9:9+data.Len()], data.Bytes())
+		return ret, nil
+	} else if t.handshakeStatus == 1 && len(b) == 0 {
+		ret := make([]byte, 43+t.sendBuf.Len())
+		copy(ret, []byte{0x14, 3, 3, 0, 1, 1, 0x16, 3, 3, 0, 0x20})
+		rand.Read(ret[11:33])
+		copy(ret[33:], t.hmacSHA1(ret[:33]))
+		copy(ret[43:], t.sendBuf.Bytes())
+		t.sendBuf.Reset()
+		t.handshakeStatus = 8
+		return ret, nil
+	}
+	return []byte{}, nil
+}
+
+func (t *tls12Ticket) packTicketBuf(u string) []byte {
+	if t.ticketBuf[u] == nil {
+		bufLen := rand.Intn(17) + 8
+		bufLen *= 16
+		t.ticketBuf[u] = make([]byte, bufLen)
+		rand.Read(t.ticketBuf[u])
+	}
+	ret := make([]byte, 4+len(t.ticketBuf[u]))
+	copy(ret, []byte{0, 0x23})
+	binary.BigEndian.PutUint16(ret[2:4], uint16(len(t.ticketBuf[u])))
+	copy(ret[4:], t.ticketBuf[u])
+	return ret
 }
 
 func (t *tls12Ticket) hmacSHA1(data []byte) []byte {
@@ -238,53 +203,39 @@ func (t *tls12Ticket) hmacSHA1(data []byte) []byte {
 	return sha1Data[:tools.HmacSHA1Len]
 }
 
-func (t *tls12Ticket) sni(u string) []byte {
-	bURL := []byte(u)
-	length := len(bURL)
-	ret := make([]byte, length+9)
-	copy(ret[9:9+length], bURL)
-	binary.BigEndian.PutUint16(ret[7:], uint16(length&0xFFFF))
-	length += 3
-	binary.BigEndian.PutUint16(ret[4:], uint16(length&0xFFFF))
-	length += 2
-	binary.BigEndian.PutUint16(ret[2:], uint16(length&0xFFFF))
-	return ret
+// pool.Get()得到的[]byte是不是全部都为0x0??
+func sni(u string, b []byte) {
+	len := len(u)
+	copy(b, []byte{0, 0})
+	binary.BigEndian.PutUint16(b[2:4], uint16(len+5))
+	binary.BigEndian.PutUint16(b[4:6], uint16(len+3))
+	copy(b[6:7], []byte{0})
+	binary.BigEndian.PutUint16(b[7:9], uint16(len))
+	copy(b[9:], []byte(u))
 }
 
 func (t *tls12Ticket) getHost() string {
-	host := t.Host
-	if len(t.Param) > 0 {
-		hosts := strings.Split(t.Param, ",")
-		if len(hosts) > 0 {
-
-			host = hosts[rand.Intn(len(hosts))]
-			host = strings.TrimSpace(host)
-		}
+	host := t.Param
+	if len(host) == 0 {
+		host = t.Host
 	}
-	if len(host) > 0 && host[len(host)-1] >= byte('0') && host[len(host)-1] <= byte('9') && len(t.Param) == 0 {
+	if len(host) > 0 && host[len(host)-1] >= '0' && host[len(host)-1] <= '9' {
 		host = ""
 	}
+	hosts := strings.Split(host, ",")
+	host = hosts[rand.Intn(len(hosts))]
 	return host
 }
 
-func (t *tls12Ticket) packAuthData() (ret []byte) {
-	retSize := 32
-	ret = make([]byte, retSize)
-
+func (t *tls12Ticket) packAuthData(authData []byte) {
 	now := time.Now().Unix()
-	binary.BigEndian.PutUint32(ret[:4], uint32(now))
-
-	rand.Read(ret[4 : 4+18])
-
-	hash := t.hmacSHA1(ret[:retSize-tools.HmacSHA1Len])
-	copy(ret[retSize-tools.HmacSHA1Len:], hash)
-
-	return
+	binary.BigEndian.PutUint32(authData, uint32(now))
+	rand.Read(authData[4:22])
+	copy(authData[22:], t.hmacSHA1(authData[:22]))
 }
 
-func packData(buffer *bytes.Buffer, suffix []byte) {
-	d := []byte{0x17, 0x3, 0x3, 0, 0}
-	binary.BigEndian.PutUint16(d[3:5], uint16(len(suffix)&0xFFFF))
-	buffer.Write(d)
-	buffer.Write(suffix)
+func packData(packedData, data []byte) {
+	copy(packedData, []byte{0x17, 3, 3})
+	binary.BigEndian.PutUint16(packedData[3:5], uint16(len(data)))
+	copy(packedData[5:], data)
 }
