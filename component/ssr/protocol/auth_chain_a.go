@@ -60,7 +60,7 @@ func (a *authChainA) initUserData() {
 			binary.LittleEndian.PutUint32(a.userID[:], uint32(userID))
 			a.userKey = []byte(params[1])
 		} else {
-			log.Errorln("Wrong protocol-param for %s, only digits are expected before ':'", a.salt)
+			log.Warnln("Wrong protocol-param for %s, only digits are expected before ':'", a.salt)
 		}
 	}
 	if len(a.userKey) == 0 {
