@@ -43,12 +43,13 @@ func (ssr *ShadowSocksR) StreamConn(c net.Conn, metadata *C.Metadata) (net.Conn,
 		iv  []byte
 		err error
 	)
-	if conn, ok := c.(*shadowstream.Conn); ok {
+	switch conn := c.(type) {
+	case *shadowstream.Conn:
 		iv, err = conn.ObtainWriteIV()
 		if err != nil {
 			return nil, err
 		}
-	} else if _, ok := c.(*shadowaead.Conn); ok {
+	case *shadowaead.Conn:
 		return nil, fmt.Errorf("invalid connection type")
 	}
 	c = ssr.protocol.StreamConn(c, iv)
