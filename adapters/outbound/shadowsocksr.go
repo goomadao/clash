@@ -108,10 +108,9 @@ func NewShadowSocksR(option ShadowSocksROption) (*ShadowSocksR, error) {
 		ciph, ok := coreCiph.(*core.StreamCipher)
 		if !ok {
 			return nil, fmt.Errorf("%s is not dummy or a supported stream cipher in ssr", cipher)
-		} else {
-			ivSize = ciph.IVSize()
-			key = ciph.Key
 		}
+		ivSize = ciph.IVSize()
+		key = ciph.Key
 	}
 
 	obfs, obfsOverhead, err := obfs.PickObfs(option.Obfs, &obfs.Base{
